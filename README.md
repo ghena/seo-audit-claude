@@ -54,3 +54,28 @@ o quando l'auto-update in background li aggiorna (dipende dalle impostazioni).
    { "name": "<nome-plugin>", "source": "./plugins/<nome-plugin>" }
    ```
 3. Commit + push. Non serve creare un nuovo marketplace per ogni plugin.
+
+## Evitare i prompt di permesso ripetuti (seo-audit)
+
+I comandi bash che l'audit lancia (script Python, server HTTP per l'HTML)
+richiedono approvazione la prima volta, per motivi di sicurezza — nessun
+plugin può auto-concedersi il permesso di eseguire codice. Il file
+`claude-settings.recommended.json` in questo repo contiene le regole scoped
+già pronte per non doverlo approvare a ogni singolo audit.
+
+Per usarlo, copia il contenuto dentro `permissions.allow` del tuo
+`~/.claude/settings.json` (personale, vale per tutti i progetti) o
+`.claude/settings.json` del progetto (condiviso col team se lo versioni):
+
+```bash
+# Esempio rapido se non hai gia' un settings.json personale:
+cp claude-settings.recommended.json ~/.claude/settings.json
+```
+
+Se hai già un `settings.json` con altre regole, unisci a mano l'array
+`permissions.allow` invece di sovrascrivere il file.
+
+Le regole usano wildcard larghi (es. `*seo_audit.py*`) invece del path
+esatto del plugin, perché `${CLAUDE_PLUGIN_ROOT}` cambia a ogni versione
+installata (contiene il numero di versione nel path) — un match letterale
+si romperebbe a ogni aggiornamento.

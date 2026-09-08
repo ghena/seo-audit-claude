@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p seo-audit-reports/*)",
+      "Bash(*seo_audit.py*)",
+      "Bash(*http.server*)",
+      "Bash(curl -s -o /dev/null *)"
+    ]
+  }
+}
