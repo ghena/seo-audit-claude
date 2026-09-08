@@ -1,0 +1,10 @@
+{
+  "name": "seo-audit",
+  "description": "Comando /seo-audit:audit per un audit SEO completo di un URL: crawling on-page, confronto con sitemap.xml, benchmark Lighthouse mobile/desktop, report CSV + HTML.",
+  "version": "1.1.0",
+  "author": {
+    "name": "Giancarlo"
+  },
+  "license": "UNLICENSED",
+  "keywords": ["seo", "audit", "crawler", "lighthouse"]
+}

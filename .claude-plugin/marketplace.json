@@ -1,0 +1,14 @@
+{
+  "name": "giancarlo-tools",
+  "owner": {
+    "name": "Giancarlo"
+  },
+  "description": "Plugin Claude Code interni",
+  "plugins": [
+    {
+      "name": "seo-audit",
+      "source": "./plugins/seo-audit",
+      "description": "Comando /seo-audit:audit per un audit SEO completo di un URL (crawling on-page, sitemap, Lighthouse, report CSV+HTML)."
+    }
+  ]
+}
