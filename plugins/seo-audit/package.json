@@ -1,0 +1,8 @@
+{
+  "name": "seo-audit-plugin-deps",
+  "private": true,
+  "description": "Dipendenze npm isolate per il plugin seo-audit (Lighthouse CLI nativo, non globale)",
+  "dependencies": {
+    "lighthouse": "^12.0.0"
+  }
+}

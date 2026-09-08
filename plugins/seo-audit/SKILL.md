@@ -15,19 +15,30 @@ un campione di pagine. Produce un report CSV dettagliato e una dashboard HTML.
 Questo comando si invoca solo manualmente con `/seo-audit:audit`, non viene attivato
 automaticamente da Claude.
 
-## Setup (una tantum per ambiente)
+## Setup (gestito automaticamente)
 
-Se non è già stato fatto in questo ambiente/progetto, installa le dipendenze
-prima di lanciare il primo audit:
+Le dipendenze sono installate automaticamente e non richiedono setup manuale:
+
+- **Lighthouse**: dichiarato come dipendenza npm reale del plugin
+  (`package.json` + lockfile) — Claude Code lo installa in automatico,
+  isolato in `${CLAUDE_PLUGIN_ROOT}/node_modules/`, ogni volta che il plugin
+  viene installato o aggiornato. Non serve `npm install -g` e non c'è rischio
+  di raccogliere per errore un binario Windows via l'interop di WSL, perché
+  non si tocca il PATH globale.
+- **Dipendenze Python** (`scripts/requirements.txt`): installate da un hook
+  `SessionStart` in un venv persistente sotto `${CLAUDE_PLUGIN_DATA}/venv`,
+  al primo avvio di ogni sessione (reinstalla solo se `requirements.txt` è
+  cambiato).
+
+Se per qualche motivo l'installazione automatica non è andata a buon fine
+(rete ristretta, ambiente atipico), puoi eseguire manualmente come fallback:
 
 ```bash
 pip install -r ${CLAUDE_PLUGIN_ROOT}/scripts/requirements.txt
-npm install -g lighthouse   # richiede Node.js + npm
 ```
 
-Se `npm install -g lighthouse` fallisce o Node.js non è disponibile, procedi
-comunque con l'audit usando `lighthouse_sample=0` (vedi sotto) e avvisa
-l'utente che i benchmark Lighthouse sono stati saltati.
+e, se serve, procedere con l'audit usando `--lighthouse-sample 0` (vedi
+sotto), avvisando l'utente che i benchmark Lighthouse sono stati saltati.
 
 ## Flusso della conversazione
 
@@ -85,16 +96,27 @@ quella cartella:
 ```bash
 mkdir -p seo-audit-reports/<dominio>_<YYYY-MM-DD>
 
-python ${CLAUDE_PLUGIN_ROOT}/scripts/seo_audit.py <url> \
+# Usa il Python del venv gestito dal plugin se presente, altrimenti fallback
+PY="${CLAUDE_PLUGIN_DATA}/venv/bin/python3"
+[ -x "$PY" ] || PY="python3"
+
+"$PY" ${CLAUDE_PLUGIN_ROOT}/scripts/seo_audit.py <url> \
   --max-depth <profondita> \
   --concurrency <concorrenza> \
   --max-pages <max_pages> \
   --max-rps <max_rps> \
   --lighthouse-sample <lighthouse_sample> \
+  --lighthouse-bin  "${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/lighthouse" \
   --output          seo-audit-reports/<dominio>_<YYYY-MM-DD>/seo_report.csv \
   --html            seo-audit-reports/<dominio>_<YYYY-MM-DD>/seo_report.html \
-  --sitemap-output  seo-audit-reports/<dominio>_<YYYY-MM-DD>/sitemap_report.csv
+  --sitemap-output  seo-audit-reports/<dominio>_<YYYY-MM-DD>/sitemap_report.csv \
+  --progress-file   seo-audit-reports/<dominio>_<YYYY-MM-DD>/.progress.json
 ```
+
+Ometti `--lighthouse-bin` solo se `${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/lighthouse`
+non esiste per qualche motivo (installazione automatica delle dipendenze npm
+fallita): in quel caso lo script ricade comunque sulla ricerca in `PATH`
+(escludendo i mount Windows di WSL) descritta più sotto.
 
 Dove `<dominio>` è l'host dell'URL senza schema né `www.` (es. `example.com`
 per `https://www.example.com`) e `<YYYY-MM-DD>` è la data odierna. Se esiste
@@ -105,6 +127,37 @@ che l'utente non chieda esplicitamente di sovrascrivere l'audit precedente.
 Ometti `--sitemap-output` solo se hai usato `--no-sitemap` (in quel caso il
 file di confronto sitemap non viene generato). Aggiungi `--no-sitemap` solo
 se l'utente ha chiesto di disabilitare il confronto con la sitemap.
+
+### Avanzamento durante l'esecuzione
+
+L'audit può richiedere diversi minuti (il crawl con `--max-rps` conservativo,
+più fino a `2 × lighthouse_sample` esecuzioni di Lighthouse da ~30-60s
+l'una). Non c'è una vera barra di progresso grafica in Claude Code: il modo
+corretto di dare visibilità sull'avanzamento è eseguire lo script in
+background e riportare periodicamente lo stato in chat leggendo il file
+`--progress-file`, che lo script aggiorna continuamente con un JSON tipo:
+
+```json
+{"phase": "crawl", "current": 145, "total": 500, "percent": 29.0, "updated_at": "...", "last_url": "...", "depth": 3}
+```
+
+Le fasi possibili nel campo `phase` sono, in ordine: `crawl`, `sitemap`,
+`lighthouse_mobile`, `lighthouse_desktop`, `report`, `done`.
+
+Procedi così:
+
+1. Lancia il comando Python con `run_in_background: true`.
+2. Ogni 20-30 secondi circa, leggi il contenuto di `.progress.json` (o
+   controlla l'output accumulato del processo in background) e riporta
+   all'utente un aggiornamento breve in chat, una riga, es.:
+   > 🔄 Crawl: 145/500 pagine (29%), profondità 3
+   oppure, in fase Lighthouse:
+   > 🔄 Lighthouse mobile: 3/5 pagine testate
+3. Continua a controllare finché `phase` non diventa `"done"`, poi passa
+   alla sezione "Dopo l'esecuzione".
+4. Non generare un aggiornamento per ogni singola pagina crawlata: sarebbe
+   rumoroso. Un check ogni 20-30 secondi (o ogni volta che l'utente chiede
+   "a che punto sei?") è sufficiente.
 
 ## Output prodotti
 
@@ -135,10 +188,64 @@ mai nella cwd nuda (vedi sezione Esecuzione):
 2. Se sono stati generati benchmark Lighthouse, evidenzia le pagine con
    punteggi bassi (Performance/Accessibility/SEO) o Core Web Vitals fuori
    soglia (LCP, TBT, CLS).
-3. Presenta all'utente sia il CSV che l'HTML come file scaricabili,
-   specificando il percorso della cartella di output usata.
-4. Se il crawl si è fermato per `--max-pages`, `--max-depth` o `robots.txt`,
+3. **Servi automaticamente l'HTML via browser** (vedi sezione dedicata subito
+   sotto) e dai all'utente il link diretto — non limitarti a indicare il
+   percorso del file. Fallo sempre, non solo se l'ambiente sembra essere
+   Docker: funziona ovunque e toglie ambiguità.
+4. Menziona comunque anche il percorso dei file CSV (utili per ulteriori
+   elaborazioni, es. import in un foglio di calcolo).
+5. Se il crawl si è fermato per `--max-pages`, `--max-depth` o `robots.txt`,
    segnalalo esplicitamente: il report potrebbe non coprire l'intero sito.
+
+### Servire l'HTML via browser (automatico, sempre)
+
+Il file HTML vive nel filesystem di dove gira il comando (spesso un
+container Docker/devcontainer): un percorso di file da solo spesso non è
+apribile direttamente dal browser sull'host. Risolvi servendo l'intera
+cartella `seo-audit-reports/` con un web server HTTP minimale, così ottieni
+sempre un link cliccabile invece di un path.
+
+Un solo server basta per tutti gli audit della sessione (non uno per
+report): prima controlla se è già in ascolto, e avvialo solo se serve.
+
+```bash
+PORT=8787
+
+# Se non risponde nulla su quella porta, avvia il server (altrimenti riusa
+# quello già attivo da un audit precedente nella stessa sessione)
+curl -s -o /dev/null "http://localhost:${PORT}/" || \
+  (cd seo-audit-reports && nohup python3 -m http.server "${PORT}" --bind 0.0.0.0 \
+    > /tmp/seo-audit-http-server.log 2>&1 &)
+
+sleep 1
+```
+
+Lancialo con `run_in_background: true` se il tool bash lo supporta, così
+resta attivo dopo la fine del comando. Poi presenta all'utente il link
+diretto al report appena generato:
+
+```
+http://localhost:8787/<dominio>_<YYYY-MM-DD>/seo_report.html
+```
+
+**Se la porta 8787 è già occupata da un processo non tuo** (raro, ma
+possibile), prova la porta successiva (8788, 8789, ...) finché `curl`
+non fallisce a connettersi, e usa quella sia per l'avvio del server sia
+nel link.
+
+**Perché funziona anche su Docker**: il server è in ascolto su `0.0.0.0`
+(non solo `localhost` dentro al container), quindi è raggiungibile
+dall'host se la porta è mappata. Nella maggior parte dei setup:
+- **VS Code Dev Containers**: la porta in ascolto viene rilevata
+  automaticamente e VS Code propone di aprirla nel browser (tab "Ports"),
+  senza bisogno di configurare nulla.
+- **Docker Compose / `docker run` manuale**: serve che la porta sia già
+  mappata verso l'host (es. `ports: ["8787:8787"]` nel `docker-compose.yml`,
+  o `-p 8787:8787` su `docker run`). Se il link non si apre, è quasi sempre
+  questo il motivo: dillo esplicitamente all'utente invece di lasciarlo
+  indovinare, e suggerisci di aggiungere il mapping e ricreare il container.
+- **Nessun Docker** (Claude Code gira direttamente sull'host): il link
+  funziona comunque identico, senza nulla da configurare.
 
 ## Note tecniche
 
@@ -150,3 +257,7 @@ mai nella cwd nuda (vedi sezione Esecuzione):
   1, il totale rispetta comunque `--max-rps`.
 - Per siti molto grandi, riduci `--lighthouse-sample` (o portalo a 0) o la
   profondità per velocizzare.
+- Lighthouse ora è una dipendenza npm dichiarata del plugin (non più
+  globale): il binario risolto ha sempre priorità su qualsiasi installazione
+  di sistema, il che evita anche il problema, riscontrato su WSL, di
+  raccogliere per errore un binario Windows esposto via interop.

@@ -97,8 +97,33 @@ class RateLimiter:
                 self.last_request = now
 
 
+def write_progress(path, phase, current, total, extra=None):
+    """Scrive lo stato di avanzamento in un file JSON in modo atomico
+    (write su file temporaneo + rename), cosi' un processo esterno che
+    legge il file non trova mai un JSON a meta' scrittura."""
+    if not path:
+        return
+    try:
+        percent = round(100.0 * current / total, 1) if total else 0.0
+        payload = {
+            'phase': phase,
+            'current': current,
+            'total': total,
+            'percent': percent,
+            'updated_at': datetime.utcnow().isoformat() + 'Z',
+        }
+        if extra:
+            payload.update(extra)
+        tmp_path = f'{path}.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f)
+        os.replace(tmp_path, path)
+    except Exception:
+        pass  # il progress-tracking non deve mai far fallire l'audit
+
+
 class SEOCrawler:
-    def __init__(self, start_url, max_pages=500, concurrency=1, max_rps=1.0, respect_robots=True, user_agent=None, max_depth=None):
+    def __init__(self, start_url, max_pages=500, concurrency=1, max_rps=1.0, respect_robots=True, user_agent=None, max_depth=None, progress_file=None):
         self.start_url = start_url.rstrip('/')
         self.domain = urlparse(self.start_url).netloc
         self.scheme = urlparse(self.start_url).scheme
@@ -107,6 +132,7 @@ class SEOCrawler:
         self.max_rps = max_rps
         self.respect_robots = respect_robots
         self.max_depth = max_depth  # None = nessun limite di profondita'
+        self.progress_file = progress_file
         self.visited = set()
         self.to_visit = [(self.start_url, 0)]
         self.url_depth = {self.start_url: 0}
@@ -314,6 +340,10 @@ class SEOCrawler:
                         continue
                     results.append(result)
                     pbar.update(1)
+                    write_progress(
+                        self.progress_file, 'crawl', len(results), self.max_pages,
+                        extra={'last_url': result.get('url'), 'depth': depth}
+                    )
                     next_depth = depth + 1
                     if self.max_depth is not None and next_depth > self.max_depth:
                         continue  # non accodare link oltre la profondita' massima
@@ -420,10 +450,58 @@ class SitemapAnalyzer:
         return self.sitemap_urls
 
 
+def find_lighthouse_binary(explicit_path=None):
+    """Cerca il binario lighthouse nativo, evitando di raccogliere per errore
+    un binario Windows esposto via interop di WSL (es. /mnt/c/.../lighthouse,
+    che ha spazi nel path tipo "Program Files" e non e' eseguibile come
+    processo Linux nativo).
+
+    Ordine di ricerca:
+    0. Path esplicito passato (--lighthouse-bin), tipicamente il node_modules
+       locale del plugin (${CLAUDE_PLUGIN_ROOT}/node_modules/.bin/lighthouse)
+       installato automaticamente da Claude Code come dipendenza npm
+       dichiarata - ha sempre priorita' assoluta se valido.
+    1. Variabile d'ambiente SEO_AUDIT_LIGHTHOUSE_BIN.
+    2. Le directory di PATH che NON iniziano per /mnt/ (esclude i mount
+       Windows di WSL).
+    3. Fallback: shutil.which() su tutto il PATH, incluso /mnt/ (ultima
+       risorsa, con avviso che potrebbe non funzionare sotto WSL).
+    """
+    if explicit_path and os.path.isfile(explicit_path) and os.access(explicit_path, os.X_OK):
+        return explicit_path, None
+
+    env_bin = os.environ.get('SEO_AUDIT_LIGHTHOUSE_BIN')
+    if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        return env_bin, None
+
+    path_dirs = os.environ.get('PATH', '').split(os.pathsep)
+    native_dirs = [d for d in path_dirs if not d.startswith('/mnt/')]
+    for d in native_dirs:
+        candidate = os.path.join(d, 'lighthouse')
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate, None
+
+    fallback = shutil.which('lighthouse')
+    if fallback:
+        warning = None
+        if fallback.startswith('/mnt/'):
+            warning = (
+                f"Trovato solo un binario lighthouse sotto un mount Windows "
+                f"({fallback}), che su WSL spesso non funziona correttamente "
+                f"con path contenenti spazi. Installane uno nativo Linux "
+                f"(vedi setup del plugin)."
+            )
+        return fallback, warning
+
+    return None, None
+
+
 class LighthouseRunner:
-    def __init__(self, sample_size=5, categories=None):
+    def __init__(self, sample_size=5, categories=None, progress_file=None, lighthouse_bin=None):
         self.sample_size = sample_size
         self.categories = categories or ['performance', 'accessibility', 'best-practices', 'seo']
+        self.progress_file = progress_file
+        self.lighthouse_bin = lighthouse_bin
 
     def sample_urls(self, urls):
         if not urls:
@@ -434,10 +512,17 @@ class LighthouseRunner:
         if not urls:
             return []
         reports = []
-        lighthouse_cmd = shutil.which('lighthouse')
+        lighthouse_cmd, warning = find_lighthouse_binary(self.lighthouse_bin)
+        if warning:
+            print(f"[WARN] {warning}")
         if not lighthouse_cmd:
             return [{'url': u, 'error': 'lighthouse executable not found in PATH', 'form_factor': form_factor} for u in urls]
-        for url in tqdm(urls, desc=f'Lighthouse {form_factor}'):
+        total = len(urls)
+        for i, url in enumerate(tqdm(urls, desc=f'Lighthouse {form_factor}')):
+            write_progress(
+                self.progress_file, f'lighthouse_{form_factor}', i, total,
+                extra={'current_url': url}
+            )
             cmd = [
                 lighthouse_cmd, url,
                 '--output=json',
@@ -449,7 +534,7 @@ class LighthouseRunner:
             for cat in self.categories:
                 cmd.append(f'--only-categories={cat}')
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, shell=True)
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180, shell=False)
                 if proc.returncode != 0:
                     reports.append({'url': url, 'form_factor': form_factor, 'error': proc.stderr[:500]})
                     continue
@@ -466,6 +551,7 @@ class LighthouseRunner:
                 reports.append({'url': url, 'form_factor': form_factor, 'scores': scores, 'metrics': metrics})
             except Exception as e:
                 reports.append({'url': url, 'form_factor': form_factor, 'error': str(e)})
+        write_progress(self.progress_file, f'lighthouse_{form_factor}', total, total)
         return reports
 
 
@@ -1109,10 +1195,13 @@ def main():
     parser.add_argument('--lighthouse-sample', type=int, default=5, help='Numero di URL random per Lighthouse (0=disabilita)')
     parser.add_argument('--lighthouse-form-factor', default='mobile', choices=['mobile', 'desktop'], help='DEPRECATED: ora esegue sempre mobile e desktop')
     parser.add_argument('--user-agent', default=None, help='User-Agent custom (default: Chrome Windows)')
+    parser.add_argument('--progress-file', default=None, help='Percorso di un file JSON aggiornato periodicamente con lo stato di avanzamento (fase, pagine correnti/totali, percentuale)')
+    parser.add_argument('--lighthouse-bin', default=None, help='Percorso esplicito del binario lighthouse (bypassa la ricerca in PATH, utile su WSL per evitare di raccogliere un binario Windows)')
     args = parser.parse_args()
 
     print(f"[INFO] Inizio crawl di {args.url}")
     print(f"[INFO] Concorrenza: {args.concurrency}, max richieste/sec: {args.max_rps}, profondita max: {args.max_depth if args.max_depth is not None else 'illimitata'}")
+    write_progress(args.progress_file, 'crawl', 0, args.max_pages)
     crawler = SEOCrawler(
         args.url,
         max_pages=args.max_pages,
@@ -1121,6 +1210,7 @@ def main():
         respect_robots=args.respect_robots,
         user_agent=args.user_agent,
         max_depth=args.max_depth,
+        progress_file=args.progress_file,
     )
     results = crawler.crawl()
     print(f"[INFO] Crawl completato: {len(results)} URL analizzati")
@@ -1128,12 +1218,14 @@ def main():
     sitemap_urls = []
     sitemap_files = []
     if not args.no_sitemap:
+        write_progress(args.progress_file, 'sitemap', 0, 1)
         domain = urlparse(args.url).netloc
         scheme = urlparse(args.url).scheme
         sitemap = SitemapAnalyzer(domain, session=crawler.session, scheme=scheme)
         sitemap_urls = sitemap.analyze()
         sitemap_files = sitemap.sitemap_files
         print(f"[INFO] URL trovati in sitemap: {len(sitemap_urls)}")
+        write_progress(args.progress_file, 'sitemap', 1, 1)
 
     # Build internal link map for orphan detection
     internal_links_map = {}
@@ -1177,13 +1269,14 @@ def main():
     lighthouse_reports_desktop = []
     if args.lighthouse_sample > 0:
         ok_urls = [r['url'] for r in results if r['status_code'] == 200]
-        runner = LighthouseRunner(sample_size=args.lighthouse_sample)
+        runner = LighthouseRunner(sample_size=args.lighthouse_sample, progress_file=args.progress_file, lighthouse_bin=args.lighthouse_bin)
         sampled = runner.sample_urls(ok_urls)
         if sampled:
             lighthouse_reports_mobile = runner.run(sampled, form_factor='mobile')
             lighthouse_reports_desktop = runner.run(sampled, form_factor='desktop')
 
     # HTML
+    write_progress(args.progress_file, 'report', 0, 1)
     domain = urlparse(args.url).netloc
     html_path = HTMLReport(
         results, sitemap_urls, sitemap_files, crawled_urls, internal_links_map,
@@ -1191,6 +1284,7 @@ def main():
         domain, args.concurrency, args.max_rps
     ).render(args.html)
     print(f"[INFO] Report HTML salvato in {html_path}")
+    write_progress(args.progress_file, 'done', 1, 1)
 
 
 if __name__ == '__main__':
